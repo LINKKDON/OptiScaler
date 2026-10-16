@@ -1,12 +1,11 @@
 name: Sync Upstream
 
-# 定期从上游 optiscaler/OptiScaler 同步更新到本 fork 的 master 分支。
+# 手动从上游 optiscaler/OptiScaler 同步更新到本 fork 的 master 分支。
 # 同步成功后推送会触发 build_zhcn.yml 自动构建中文版。
+# 也可以直接在 GitHub 页面点 "Sync fork" 按钮同步，效果一样。
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 3 * * *'  # 每天 UTC 03:00 检查一次
 
 permissions:
   contents: write
