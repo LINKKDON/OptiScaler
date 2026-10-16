@@ -89,7 +89,7 @@ jobs:
         $dll = "${{ github.workspace }}\x64\Release\a\OptiScaler.dll"
         $headers = @{ Authorization = "Bearer ${{ secrets.SIGNPATH_API_TOKEN }}" }
 
-        Write-Output "提交签名请求..."
+        Write-Output "Submitting signing request..."
         $form = @{
           signingPolicyId = $policyId
           description = "GitHub Actions signed build ${{ github.run_id }}"
@@ -98,24 +98,24 @@ jobs:
         $resp = Invoke-RestMethod -Uri "https://app.signpath.io/api/v1/$orgId/SigningRequests/SubmitWithArtifact" `
           -Method Post -Headers $headers -Form $form
         $reqId = $resp.signingRequestId
-        Write-Output "签名请求 ID: $reqId"
+        Write-Output "Signing request ID: $reqId"
 
-        Write-Output "等待签名完成..."
+        Write-Output "Waiting for signing to complete..."
         $deadline = (Get-Date).AddMinutes(10)
         while ((Get-Date) -lt $deadline) {
           Start-Sleep -Seconds 15
           $status = Invoke-RestMethod -Uri "https://app.signpath.io/api/v1/$orgId/SigningRequests/$reqId/Status" `
             -Headers $headers
-          Write-Output "状态: $($status.status)"
+          Write-Output "Status: $($status.status)"
           if ($status.status -eq "Completed") { break }
-          if ($status.status -eq "Failed") { Write-Error "签名失败: $($status | ConvertTo-Json)"; exit 1 }
+          if ($status.status -eq "Failed") { Write-Error "Signing failed"; exit 1 }
         }
 
-        Write-Output "下载签名后的 DLL..."
+        Write-Output "Downloading signed DLL..."
         New-Item -ItemType Directory -Force -Path ".\signed" | Out-Null
         Invoke-RestMethod -Uri "https://app.signpath.io/api/v1/$orgId/SigningRequests/$reqId/SignedArtifact" `
           -Headers $headers -OutFile ".\signed\OptiScaler.dll"
-        Write-Output "签名完成"
+        Write-Output "Signing complete"
 
     - name: Copy back signed DLL
       working-directory: ${{ github.workspace }}
