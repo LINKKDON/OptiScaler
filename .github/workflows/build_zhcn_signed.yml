@@ -82,7 +82,7 @@ jobs:
 
     - name: Sign with SignPath (REST API)
       id: sign
-      shell: powershell
+      shell: pwsh
       run: |
         $orgId = "d62571e9-818a-4296-bf46-46db55b1a44e"
         $policyId = "08634ea0-3ec2-46df-8a03-755a138a1565"
