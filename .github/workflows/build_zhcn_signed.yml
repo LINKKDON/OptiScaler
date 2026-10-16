@@ -1,0 +1,148 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+name: Build Chinese (Signed)
+
+# 手动触发：汉化构建 + SignPath 代码签名。
+# 流程：检出 -> 应用汉化 -> MSBuild -> 上传未签名 DLL -> SignPath 签名 -> 打包 -> 发 Release。
+# 需要仓库 Secrets: SIGNPATH_API_TOKEN
+
+on:
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: Release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    environment: Build
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: 'true'
+
+    - name: Apply Chinese localization
+      shell: python
+      run: |
+        import subprocess, sys
+        r = subprocess.run([sys.executable, "tools_cn/localize.py"])
+        sys.exit(r.returncode)
+
+    - name: Extract Version
+      id: get_version
+      working-directory: ${{ github.workspace }}
+      shell: powershell
+      run: |
+        $resourceFile = ".\OptiScaler\resource.h"
+        if (-Not (Test-Path $resourceFile)) {
+            Write-Error "File not found: $resourceFile"
+            exit 1
+        }
+        function Get-Version-Component {
+            param ([string]$pattern, [string]$replacement)
+            $line = Get-Content $resourceFile | Select-String -Pattern $pattern | Select-Object -First 1
+            if ($line) { return ($line.Line -replace $replacement).Trim() }
+            else { Write-Error "Pattern not found: $pattern"; exit 1 }
+        }
+        $majorVersion = Get-Version-Component 'VER_MAJOR_VERSION' '#define VER_MAJOR_VERSION\s+'
+        $minorVersion = Get-Version-Component 'VER_MINOR_VERSION' '#define VER_MINOR_VERSION\s+'
+        $hotfixVersion = Get-Version-Component 'VER_HOTFIX_VERSION' '#define VER_HOTFIX_VERSION\s+'
+        $buildVersion = Get-Version-Component 'VER_BUILD_NUMBER' '#define VER_BUILD_NUMBER\s+'
+        $version = "v$majorVersion.$minorVersion.$hotfixVersion-pre$buildVersion"
+        $date = Get-Date -Format "yyyyMMdd"
+        $outputFileName = "OptiScaler_${version}_${date}"
+        Write-Output "Generated Filename: $outputFileName"
+        "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "filename=$outputFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "date=$date" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      continue-on-error: false
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} ${{env.SOLUTION_FILE_PATH}} /verbosity:minimal
+
+    - name: Upload unsigned DLL
+      id: upload-unsigned-artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: '${{ steps.get_version.outputs.filename }}_unsigned_dll'
+        path: '${{ github.workspace }}\x64\Release\a\OptiScaler.dll'
+        if-no-files-found: error
+
+    - name: Sign with SignPath
+      id: sign
+      uses: signpath/github-action-submit-signing-request@v2
+      with:
+        api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+        organization-id: 'd62571e9-818a-4296-bf46-46db55b1a44e'
+        project-slug: 'optiscaler-zhcn'
+        signing-policy-slug: 'release-signing'
+        github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
+        wait-for-completion: true
+        output-artifact-directory: 'signed'
+
+    - name: Copy back signed DLL
+      working-directory: ${{ github.workspace }}
+      shell: powershell
+      run: |
+        cd .\signed
+        copy .\OptiScaler.dll '${{ github.workspace }}\x64\Release\a\OptiScaler.dll' -Force
+
+    - name: Compress the artifact
+      shell: powershell
+      run: |
+        $zipName = "OptiScaler-zhcn-signed_${{ steps.get_version.outputs.filename }}.7z"
+        7z a -r "${{ github.workspace }}\$zipName" "${{ github.workspace }}\x64\Release\a\*.*"
+        "zipname=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      id: compress
+      continue-on-error: false
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: 'OptiScaler-zhcn-signed_${{ steps.get_version.outputs.filename }}'
+        path: '${{ github.workspace }}\${{ steps.compress.outputs.zipname }}'
+        if-no-files-found: error
+
+    - name: Create Release
+      shell: powershell
+      run: |
+        $tag = "zh-cn-signed-${{ steps.get_version.outputs.filename }}"
+        $zipName = "${{ steps.compress.outputs.zipname }}"
+        $existing = gh release view $tag --json tagName 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          Write-Output "Release $tag 已存在，先删除旧的"
+          gh release delete $tag --yes
+          git push origin ":refs/tags/$tag" 2>$null
+        }
+        $notes = @"
+        ## 🇨🇳 OptiScaler 中文版 (签名构建)
+
+        基于官方 master 自动同步并汉化构建，SignPath 代码签名。
+
+        **汉化内容:**
+        - 游戏内菜单全中文化 (tools_cn/dict_v10.json)
+        - 内嵌 CJK 中文字体
+        - 仅替换显示字符串，不改功能逻辑
+
+        **签名:** SignPath 自签名测试证书 (Windows 会显示未知发布者，仅用于测试签名流程)
+
+        **上游版本:** ${{ steps.get_version.outputs.version }} | **构建日期:** ${{ steps.get_version.outputs.date }}
+        "@
+        gh release create $tag `
+          --title "中文版(签名) ${{ steps.get_version.outputs.version }} (${{ steps.get_version.outputs.date }})" `
+          --prerelease `
+          --notes $notes `
+          "${{ github.workspace }}\$zipName"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
