@@ -1,0 +1,41 @@
+name: Sync Upstream
+
+# 定期从上游 optiscaler/OptiScaler 同步更新到本 fork 的 master 分支。
+# 同步成功后推送会触发 build_zhcn.yml 自动构建中文版。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'  # 每天 UTC 03:00 检查一次
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/optiscaler/OptiScaler.git
+          git fetch upstream master
+          BEFORE=$(git rev-parse HEAD)
+          if git merge --ff-only upstream/master; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              echo "Upstream has new commits, pushing..."
+              git push origin master
+            else
+              echo "Already up to date."
+            fi
+          else
+            echo "::warning::Fast-forward merge failed, manual intervention needed."
+            exit 1
+          fi
