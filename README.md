@@ -1,3 +1,21 @@
+> ## 🇨🇳 中文版说明
+>
+> 这是 [optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler) 官方 master 分支的**中文汉化 fork**，基于最新 nightly 源码构建。
+>
+> **汉化内容：**
+> - 游戏内覆盖菜单（按 `Insert` 呼出）全中文化，共 1374 处字符串
+> - 内嵌 CJK 子集中文字体，中文显示正常，无需额外设置
+> - 技术名词（DLSS / FSR / XeSS / XeFG 等）保留英文原名
+>
+> **与上游的关系：**
+> - 代码与官方 master 保持同步，仅替换菜单显示字符串 + 嵌入中文字体，不改任何功能逻辑
+> - 汉化字典与工具链在 [`tools_cn/`](./tools_cn/) 目录下，官方更新后可一键重新汉化
+>
+> **下载：**
+> - 每次推送后 GitHub Actions 会自动构建，构建产物见 [Actions](../../actions) 页面的 Artifacts，或直接下载 [Releases](../../releases) 中的 `OptiScaler_*.7z`
+> - 解压后将 `OptiScaler.dll` 改名（如 `dxgi.dll` / `nvngx.dll` 等）放入游戏目录即可，具体见下方英文安装说明
+>
+> ---
 <div align="center">
 
   ![Logo](https://github.com/user-attachments/assets/c7dad5da-0b29-4710-8a57-b58e4e407abd)
