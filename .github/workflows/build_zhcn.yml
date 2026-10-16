@@ -98,6 +98,13 @@ jobs:
       run: |
         $tag = "zh-cn-${{ steps.get_version.outputs.filename }}"
         $zipName = "${{ steps.compress.outputs.zipname }}"
+        # 如果同名 release 已存在则先删除，保证重复构建时幂等
+        $existing = gh release view $tag --json tagName 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          Write-Output "Release $tag 已存在，先删除旧的"
+          gh release delete $tag --yes
+          git push origin ":refs/tags/$tag" 2>$null
+        }
         $notes = @"
         ## 🇨🇳 OptiScaler 中文版 (自动构建)
 
