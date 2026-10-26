@@ -94,7 +94,7 @@ jobs:
         if-no-files-found: error
 
     - name: Create Release
-      shell: powershell
+      shell: pwsh
       run: |
         $tag = "zh-cn-${{ steps.get_version.outputs.filename }}"
         $zipName = "${{ steps.compress.outputs.zipname }}"
