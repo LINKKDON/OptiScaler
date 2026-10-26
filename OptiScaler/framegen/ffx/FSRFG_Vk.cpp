@@ -3,6 +3,7 @@
 
 #include <State.h>
 #include <hooks/Vulkan_Hooks.h>
+#include <fsr4/FSR4DriverProviderVk.h>
 
 #include <magic_enum.hpp>
 
@@ -185,6 +186,13 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
         return false;
     }
 
+    // FFX handles a single swapchain, taking another window's would destroy the one the game still renders to
+    if (_swapchain != VK_NULL_HANDLE && pCreateInfo->surface != _surface)
+    {
+        LOG_INFO("Swapchain is for another surface, leaving it to the game");
+        return false;
+    }
+
     // Only one swapchain can exist for a window
     if (_swapchain != VK_NULL_HANDLE)
     {
@@ -229,8 +237,38 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
                                    nullptr };
     };
 
+    QueryVersions();
+    _swapchainOutdated = false;
+
+    // ML FG only works with the driver's swapchain, the version can't be switched without recreating it
+    _ffxSwapchain = FfxApiProxy::VkFfxModule();
+
+    if (IsDriverVersionSelected())
+    {
+        if (FSR4DriverProviderVk::IsFgSupported(device, _physicalDevice, &VulkanHooks::GetDeviceProcAddr))
+            _ffxSwapchain = FSR4DriverProviderVk::FgSwapchainModule();
+        else
+            LOG_WARN("Driver provided FG is not supported on this device, using the SDK one");
+    }
+
+    if (_ffxSwapchain->CreateContext == nullptr)
+    {
+        LOG_WARN("No FFX swapchain provider");
+        return false;
+    }
+
+    LOG_INFO("Using {} FG swapchain", UsesDriver() ? "driver" : "SDK");
+
+    ffxCreateContextDescFrameGenerationSwapChainVersionVKV2 swapchainVersion {};
+    swapchainVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VERSION_VK_V2;
+    swapchainVersion.version = FFX_FGSWAPCHAIN_VERSION_VK_V2;
+
     ffxCreateContextDescFrameGenerationSwapChainVK desc {};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
+
+    if (UsesDriver())
+        desc.header.pNext = &swapchainVersion.header;
+
     desc.physicalDevice = _physicalDevice;
     desc.device = device;
     desc.swapchain = &_swapchain;
@@ -241,9 +279,10 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
     desc.presentQueue = queueInfo(presentQueue);
     desc.imageAcquireQueue = queueInfo(acquireQueue);
 
-    BypassOverlayHooks(FfxApiProxy::VkModule());
+    if (!UsesDriver())
+        BypassOverlayHooks(FfxApiProxy::VkModule());
 
-    auto result = FfxApiProxy::VULKAN_CreateContext()(&_swapChainContext, &desc.header, nullptr);
+    auto result = _ffxSwapchain->CreateContext(&_swapChainContext, &desc.header, nullptr);
     LOG_INFO("Swapchain context creation result: {}", FfxApiProxy::ReturnCodeToString(result));
 
     if (result != FFX_API_RETURN_OK)
@@ -255,8 +294,9 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
 
     _functions = {};
     _functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
-    FfxApiProxy::VULKAN_Query()(&_swapChainContext, &_functions.header);
+    _ffxSwapchain->Query(&_swapChainContext, &_functions.header);
 
+    _surface = pCreateInfo->surface;
     _swapchainFormat = pCreateInfo->imageFormat;
     _swapchainExtent = pCreateInfo->imageExtent;
     *pSwapchain = _swapchain;
@@ -292,6 +332,10 @@ VkResult FSRFG_Vk::GetSwapchainImages(VkDevice device, VkSwapchainKHR swapchain,
 VkResult FSRFG_Vk::AcquireNextImage(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
                                     VkFence fence, uint32_t* pImageIndex)
 {
+    // Nothing gets acquired or signaled, the game has to recreate the swapchain
+    if (_swapchainOutdated)
+        return VK_ERROR_OUT_OF_DATE_KHR;
+
     return _functions.pOutAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
 }
 
@@ -321,7 +365,7 @@ void FSRFG_Vk::ReleaseSwapchainContext()
 
     if (_swapChainContext != nullptr)
     {
-        auto result = FfxApiProxy::VULKAN_DestroyContext()(&_swapChainContext, nullptr);
+        auto result = _ffxSwapchain->DestroyContext(&_swapChainContext, nullptr);
         LOG_INFO("Destroy swapchain context result: {}", FfxApiProxy::ReturnCodeToString(result));
         _swapChainContext = nullptr;
     }
@@ -331,6 +375,7 @@ void FSRFG_Vk::ReleaseSwapchainContext()
 
     _presentViews.clear();
     _swapchain = VK_NULL_HANDLE;
+    _surface = VK_NULL_HANDLE;
     _functions = {};
 }
 
@@ -359,18 +404,17 @@ void FSRFG_Vk::CreateContext()
     auto& state = State::Instance();
     auto config = Config::Instance();
 
-    ffxQueryDescGetVersions versionQuery {};
-    versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-    uint64_t versionCount = 0;
-    versionQuery.outputCount = &versionCount;
-    FfxApiProxy::VULKAN_Query()(nullptr, &versionQuery.header);
+    QueryVersions();
 
-    state.ffxFGVersionIds.resize(versionCount);
-    state.ffxFGVersionNames.resize(versionCount);
-    versionQuery.versionIds = state.ffxFGVersionIds.data();
-    versionQuery.versionNames = state.ffxFGVersionNames.data();
-    FfxApiProxy::VULKAN_Query()(nullptr, &versionQuery.header);
+    const bool driver = UsesDriver();
+
+    if (driver != IsDriverVersionSelected() && !_swapchainOutdated)
+    {
+        LOG_INFO("Selected FG version needs a {} swapchain, making the game recreate it", driver ? "SDK" : "driver");
+        _swapchainOutdated = true;
+    }
+
+    _ffx = driver ? FSR4DriverProviderVk::FgModule() : FfxApiProxy::VkFfxModule();
 
     ffxCreateBackendVKDesc backendDesc {};
     backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -415,12 +459,27 @@ void FSRFG_Vk::CreateContext()
     ffxOverrideVersion override {};
     override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
 
-    if (versionCount > 0)
-    {
-        if (config->FfxFGIndex.value_or_default() < 0 || config->FfxFGIndex.value_or_default() >= versionCount)
-            config->FfxFGIndex.set_volatile_value(0);
+    ffxCreateContextDescFrameGenerationVersionV2 fgVersion {};
+    fgVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION_V2;
+    fgVersion.version = FFX_FRAMEGENERATION_VERSION_V2;
 
+    if (driver)
+    {
+        LOG_INFO("Using driver provided FG {}", FSR4DriverProviderVk::FgVersionName());
+
+        // Driver only recognizes the SDK 2.x backend type, version override is not needed
+        backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_V2;
+        backendDesc.header.pNext = &fgVersion.header;
+        _version.parse_version(FSR4DriverProviderVk::FgVersionName());
+    }
+    else if (!state.ffxFGVersionIds.empty())
+    {
         auto index = config->FfxFGIndex.value_or_default();
+
+        // Driver entry is last, the SDK's default is the first one
+        if (IsDriverVersionSelected())
+            index = 0;
+
         override.versionId = state.ffxFGVersionIds[index];
         _version.parse_version(state.ffxFGVersionNames[index]);
 
@@ -428,10 +487,18 @@ void FSRFG_Vk::CreateContext()
         createFg.header.pNext = &override.header;
     }
 
+    if (_ffx->CreateContext == nullptr)
+    {
+        LOG_ERROR("No FFX FG provider");
+        _fgContext = nullptr;
+        _isActive = false;
+        return;
+    }
+
     ffxReturnCode_t result;
     {
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
-        result = FfxApiProxy::VULKAN_CreateContext()(&_fgContext, &createFg.header, nullptr);
+        result = _ffx->CreateContext(&_fgContext, &createFg.header, nullptr);
     }
 
     LOG_INFO("FG context creation result: {}", FfxApiProxy::ReturnCodeToString(result));
@@ -450,8 +517,84 @@ void FSRFG_Vk::CreateContext()
     fgLogging.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
     fgLogging.fpMessage = &fgLogCallback;
     fgLogging.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE;
-    FfxApiProxy::VULKAN_Configure()(&_fgContext, &fgLogging.header);
+    _ffx->Configure(&_fgContext, &fgLogging.header);
+
+    ConfigureFramePaceTuning();
 }
+
+void FSRFG_Vk::ConfigureFramePaceTuning()
+{
+    State::Instance().fsrfgFramePaceTuningChanged = false;
+
+    auto config = Config::Instance();
+
+    // Versions are FFX SDK ones here, 1.1.3 shipped FSR 3.1.3 which added the tuning
+    if (_swapChainContext == nullptr || _version < feature_version { 1, 1, 3 } ||
+        !config->FGFramePacingTuning.value_or_default())
+        return;
+
+    // The Vulkan swapchain only reads safetyMarginInMs and varianceFactor
+    FfxApiSwapchainFramePacingTuning fpt {};
+    fpt.safetyMarginInMs = config->FGFPTSafetyMarginInMs.value_or_default();
+    fpt.varianceFactor = config->FGFPTVarianceFactor.value_or_default();
+
+    ffxConfigureDescFrameGenerationSwapChainKeyValueVK cfgDesc {};
+    cfgDesc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
+    cfgDesc.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING_VK;
+    cfgDesc.ptr = &fpt;
+
+    auto result = _ffxSwapchain->Configure(&_swapChainContext, &cfgDesc.header);
+    LOG_DEBUG("Frame pacing tuning configure result: {}", FfxApiProxy::ReturnCodeToString(result));
+}
+
+// SDK versions followed by the driver's ML FG
+void FSRFG_Vk::QueryVersions()
+{
+    auto& state = State::Instance();
+    state.ffxFGVersionIds.clear();
+    state.ffxFGVersionNames.clear();
+
+    if (FfxApiProxy::VULKAN_Query() != nullptr)
+    {
+        ffxQueryDescGetVersions versionQuery {};
+        versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+        versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+        uint64_t versionCount = 0;
+        versionQuery.outputCount = &versionCount;
+        FfxApiProxy::VULKAN_Query()(nullptr, &versionQuery.header);
+
+        state.ffxFGVersionIds.resize(versionCount);
+        state.ffxFGVersionNames.resize(versionCount);
+        versionQuery.versionIds = state.ffxFGVersionIds.data();
+        versionQuery.versionNames = state.ffxFGVersionNames.data();
+        FfxApiProxy::VULKAN_Query()(nullptr, &versionQuery.header);
+    }
+
+    if (FSR4DriverProviderVk::InitFg())
+    {
+        state.ffxFGVersionIds.push_back(FSR4DriverProviderVk::FgVersionId());
+        state.ffxFGVersionNames.push_back(FSR4DriverProviderVk::FgVersionName());
+    }
+
+    auto config = Config::Instance();
+
+    if (config->FfxFGIndex.value_or_default() < 0 ||
+        config->FfxFGIndex.value_or_default() >= state.ffxFGVersionIds.size())
+    {
+        config->FfxFGIndex.set_volatile_value(0);
+    }
+}
+
+bool FSRFG_Vk::IsDriverVersionSelected()
+{
+    auto& ids = State::Instance().ffxFGVersionIds;
+    auto index = Config::Instance()->FfxFGIndex.value_or_default();
+
+    return FSR4DriverProviderVk::IsFgAvailable() && index >= 0 && index < ids.size() &&
+           ids[index] == FSR4DriverProviderVk::FgVersionId();
+}
+
+bool FSRFG_Vk::UsesDriver() const { return _ffxSwapchain == FSR4DriverProviderVk::FgSwapchainModule(); }
 
 void FSRFG_Vk::DestroyFGContext()
 {
@@ -463,7 +606,7 @@ void FSRFG_Vk::DestroyFGContext()
     // Our prepare commands use the context's resources
     WaitForCommandBuffers();
 
-    auto result = FfxApiProxy::VULKAN_DestroyContext()(&_fgContext, nullptr);
+    auto result = _ffx->DestroyContext(&_fgContext, nullptr);
     LOG_INFO("Destroy FG context result: {}", FfxApiProxy::ReturnCodeToString(result));
     _fgContext = nullptr;
 }
@@ -475,7 +618,7 @@ ffxReturnCode_t FSRFG_Vk::ConfigureEnabled(bool enabled)
     fgConfig.frameGenerationEnabled = enabled;
     fgConfig.swapChain = _swapchain;
 
-    auto result = FfxApiProxy::VULKAN_Configure()(&_fgContext, &fgConfig.header);
+    auto result = _ffx->Configure(&_fgContext, &fgConfig.header);
     LOG_INFO("Enabled: {}, result: {}", enabled, FfxApiProxy::ReturnCodeToString(result));
 
     return result;
@@ -548,9 +691,14 @@ void FSRFG_Vk::EvaluateState(FG_Constants& fgConstants)
                 DestroyFGContext();
         }
     }
-    else if (IsActive())
+    else
     {
-        Deactivate();
+        if (IsActive())
+            Deactivate();
+
+        // The change flags are cleared below, so a pending recreation (e.g. FFX FG version) must happen now
+        if (state.scChanged)
+            DestroyFGContext();
     }
 
     if (state.fgChanged)
@@ -590,6 +738,9 @@ bool FSRFG_Vk::Dispatch()
 
     if (fIndex < 0 || !IsActive() || IsPaused())
         return false;
+
+    if (State::Instance().fsrfgFramePaceTuningChanged)
+        ConfigureFramePaceTuning();
 
     auto depth = GetResource(FG_ResourceType::Depth, fIndex);
     auto velocity = GetResource(FG_ResourceType::Velocity, fIndex);
@@ -653,7 +804,18 @@ bool FSRFG_Vk::Dispatch()
         // The HUD shaders change and read our copy.
         if (hudless->format != _swapchainFormat || HudCutoffThreshold().has_value() || state.fgHudlessCompare)
         {
-            _hudlessInCopy[fIndex] = CopyImage(cmdBuffer, *hudless, _hudlessCopies[fIndex], _swapchainFormat);
+            // Already copied by SetResource in the right format, no need for another one
+            if (auto own = OwnCopy(*hudless, (int) fIndex); own != nullptr && hudless->format == _swapchainFormat)
+            {
+                DestroyCopy(_hudlessCopies[fIndex]);
+                _hudlessTarget[fIndex] = *own;
+                _hudlessInCopy[fIndex] = true;
+            }
+            else
+            {
+                _hudlessInCopy[fIndex] = CopyImage(cmdBuffer, *hudless, _hudlessCopies[fIndex], _swapchainFormat);
+                _hudlessTarget[fIndex] = _hudlessCopies[fIndex];
+            }
 
             if (!_hudlessInCopy[fIndex])
                 hudless.reset();
@@ -676,7 +838,7 @@ bool FSRFG_Vk::Dispatch()
     fgConfig.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t
     { return reinterpret_cast<FSRFG_Vk*>(pUserCtx)->DispatchCallback(params); };
 
-    auto result = FfxApiProxy::VULKAN_Configure()(&_fgContext, &fgConfig.header);
+    auto result = _ffx->Configure(&_fgContext, &fgConfig.header);
     LOG_DEBUG("Configure result: {}, frame: {}, fIndex: {}", FfxApiProxy::ReturnCodeToString(result), willDispatchFrame,
               fIndex);
 
@@ -726,7 +888,7 @@ bool FSRFG_Vk::Dispatch()
     ImageBarrier(cmdBuffer, depth->image, depth->format, depth->layout, readLayout);
     ImageBarrier(cmdBuffer, velocity->image, velocity->format, velocity->layout, readLayout);
 
-    result = FfxApiProxy::VULKAN_Dispatch()(&_fgContext, &dfgPrepare.header);
+    result = _ffx->Dispatch(&_fgContext, &dfgPrepare.header);
     LOG_DEBUG("Prepare result: {}, frame: {}, fIndex: {}", FfxApiProxy::ReturnCodeToString(result), willDispatchFrame,
               fIndex);
 
@@ -759,6 +921,13 @@ ffxReturnCode_t FSRFG_Vk::DispatchCallback(ffxDispatchDescFrameGeneration* param
 
     params->reset = !config->FGSkipReset.value_or_default() && _reset[fIndex] != 0;
 
+    // Async needs consecutive frame ids unless resetting, they skip after pauses
+    if (params->frameID != _lastDispatchedFrameId + 1 && !params->reset)
+    {
+        LOG_DEBUG("Frame id {} after {}, resetting", params->frameID, _lastDispatchedFrameId);
+        params->reset = true;
+    }
+
     if (params->frameID == _lastDispatchedFrameId)
     {
         LOG_WARN("Dispatched with the same frame id! frameID: {}", params->frameID);
@@ -776,7 +945,7 @@ ffxReturnCode_t FSRFG_Vk::DispatchCallback(ffxDispatchDescFrameGeneration* param
 
     DispatchHudShaders(params);
 
-    return FfxApiProxy::VULKAN_Dispatch()(&_fgContext, &params->header);
+    return _ffx->Dispatch(&_fgContext, &params->header);
 }
 
 void FSRFG_Vk::DispatchHudShaders(ffxDispatchDescFrameGeneration* params)
@@ -792,7 +961,7 @@ void FSRFG_Vk::DispatchHudShaders(ffxDispatchDescFrameGeneration* params)
         return;
     }
 
-    auto& copy = _hudlessCopies[fIndex];
+    auto& copy = _hudlessTarget[fIndex];
     auto hudlessInfo = GetImageInfo(copy.image, copy.view, copy.format, copy.width, copy.height);
     const auto hudlessLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
@@ -846,85 +1015,4 @@ VkImageView FSRFG_Vk::PresentView(VkImage image)
 
     _presentViews[image] = view;
     return view;
-}
-
-VkCommandBuffer FSRFG_Vk::BeginCommandBuffer(int index)
-{
-    // Fence is created last, without it the rest might be missing too
-    if (_fence[index] == VK_NULL_HANDLE)
-    {
-        VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        poolInfo.queueFamilyIndex = _gameQueueFamily;
-
-        if (_commandPool[index] == VK_NULL_HANDLE &&
-            vkCreateCommandPool(_device, &poolInfo, nullptr, &_commandPool[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkCreateCommandPool failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-
-        VkCommandBufferAllocateInfo allocInfo { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        allocInfo.commandPool = _commandPool[index];
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-
-        if (_commandBuffer[index] == VK_NULL_HANDLE &&
-            vkAllocateCommandBuffers(_device, &allocInfo, &_commandBuffer[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkAllocateCommandBuffers failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-
-        VkFenceCreateInfo fenceInfo { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-        if (vkCreateFence(_device, &fenceInfo, nullptr, &_fence[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkCreateFence failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-    }
-
-    if (vkWaitForFences(_device, 1, &_fence[index], VK_TRUE, 1'000'000'000) != VK_SUCCESS)
-    {
-        LOG_ERROR("Waiting for the FG command buffer {} timed out", index);
-        return VK_NULL_HANDLE;
-    }
-
-    vkResetCommandPool(_device, _commandPool[index], 0);
-
-    VkCommandBufferBeginInfo beginInfo { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(_commandBuffer[index], &beginInfo);
-
-    return _commandBuffer[index];
-}
-
-void FSRFG_Vk::WaitForCommandBuffers()
-{
-    for (auto fence : _fence)
-    {
-        if (fence != VK_NULL_HANDLE)
-            vkWaitForFences(_device, 1, &fence, VK_TRUE, 1'000'000'000);
-    }
-}
-
-void FSRFG_Vk::DestroyCommandBuffers()
-{
-    WaitForCommandBuffers();
-
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-    {
-        if (_fence[i] != VK_NULL_HANDLE)
-            vkDestroyFence(_device, _fence[i], nullptr);
-
-        // Frees the command buffer too
-        if (_commandPool[i] != VK_NULL_HANDLE)
-            vkDestroyCommandPool(_device, _commandPool[i], nullptr);
-
-        _fence[i] = VK_NULL_HANDLE;
-        _commandPool[i] = VK_NULL_HANDLE;
-        _commandBuffer[i] = VK_NULL_HANDLE;
-    }
 }
