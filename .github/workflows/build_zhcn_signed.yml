@@ -5,12 +5,20 @@
 
 name: Build Chinese (Signed)
 
-# 手动触发：汉化构建 + SignPath 代码签名。
+# 手动触发或推送到 master 时自动触发（上游同步后）：汉化构建 + SignPath 代码签名。
 # 流程：检出 -> 应用汉化 -> MSBuild -> 上传未签名 DLL -> SignPath 签名 -> 打包 -> 发 Release。
 # 需要仓库 Secrets: SIGNPATH_API_TOKEN
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ "master" ]
+    paths-ignore:
+    - 'tools_cn/**'
+    - '.github/workflows/sync_upstream.yml'
+    - '.github/workflows/build_zhcn.yml'
+    - '.github/workflows/build_zhcn_signed.yml'
+    - 'README.md'
 
 env:
   SOLUTION_FILE_PATH: .
